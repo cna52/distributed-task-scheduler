@@ -1,0 +1,33 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler_test"
+          --health-interval 2s --health-timeout 2s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 2s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: gofmt -l . | tee /tmp/unformatted && test ! -s /tmp/unformatted
+      - run: go test -race ./...
+        env:
+          TEST_DATABASE_URL: postgres://scheduler:scheduler@localhost:5432/scheduler_test?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/1
+      - run: go build ./...
