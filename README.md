@@ -63,7 +63,14 @@ The binaries accept `DATABASE_URL`, `REDIS_URL`, `HTTP_ADDR`, `WORKER_CONCURRENC
 
 ## Failure drills and benchmark
 
-With the full stack running, submit a long `sleep` job, wait for `running`, then stop a worker container without a graceful shutdown. The dispatcher will detect its expired lease, retry it, and reject any completion from the old token. To test Redis loss, stop Redis, submit a job, restart Redis, and observe pending outbox publication. To test a lost pop, the integration suite removes a ready ID before claiming it and verifies reconciliation.
+With the full stack running, submit a long `sleep` job, wait for `running`, then force-kill the worker holding it and start a replacement. The dispatcher will detect its expired lease and retry it. To test a Redis outage, stop Redis, submit a job, restart Redis, and observe pending outbox publication. To test a lost pop, the integration suite removes a ready ID before claiming it and verifies reconciliation. The integration suite also checks that an old lease token cannot complete a job.
+
+Observed local failure drills on 2026-10-24:
+
+| Drill | State during failure | Recovery observed |
+| --- | --- | --- |
+| Worker crash | A 15-second `sleep` job was `running` on attempt 1 with a 5-second lease when its worker received `SIGKILL`. | The dispatcher logged one expired lease; a replacement worker claimed attempt 2, and the job `succeeded` at 18:29:23 UTC. |
+| Redis outage | With Redis stopped, `POST /jobs` accepted a `record_event` job. PostgreSQL showed `queued`, 0 attempts, and one pending outbox event. | After Redis restarted, the job `succeeded` on attempt 1, the pending outbox count became 0, and exactly one event was recorded. |
 
 ```sh
 go run . bench -jobs 1000 -concurrency 20 -duration-ms 0
