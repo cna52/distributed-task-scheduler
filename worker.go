@@ -14,44 +14,72 @@ import (
 )
 
 type Worker struct {
-	Store       *Store
-	Queue       *Queue
-	Concurrency int
-	Lease       time.Duration
-	Logger      *slog.Logger
+	Store         *Store
+	Queue         *Queue
+	Concurrency   int
+	Lease         time.Duration
+	ShutdownGrace time.Duration
+	Objects       *ObjectStore
+	Logger        *slog.Logger
 }
 
 func (w *Worker) run(ctx context.Context) {
+	active, cancelActive := context.WithCancel(context.Background())
+	defer cancelActive()
 	var wg sync.WaitGroup
 	for i := 0; i < w.Concurrency; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); w.loop(ctx) }()
+		go func() { defer wg.Done(); w.loop(ctx, active) }()
 	}
-	wg.Wait()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	}
+	grace := w.ShutdownGrace
+	if grace <= 0 {
+		grace = 20 * time.Second
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		w.Logger.Warn("shutdown grace expired; active jobs will recover by lease")
+		cancelActive()
+	}
 }
 
-func (w *Worker) loop(ctx context.Context) {
-	for ctx.Err() == nil {
-		id, err := w.Queue.pop(ctx)
+func (w *Worker) loop(intake, active context.Context) {
+	for intake.Err() == nil {
+		id, err := w.Queue.pop(intake)
 		if err != nil {
+			if intake.Err() != nil {
+				return
+			}
 			w.Logger.Error("queue pop", "error", err)
-			idleWait(ctx, time.Second)
+			idleWait(intake, time.Second)
 			continue
+		}
+		if intake.Err() != nil {
+			return
 		}
 		if id == "" {
-			idleWait(ctx, 200*time.Millisecond)
+			idleWait(intake, 200*time.Millisecond)
 			continue
 		}
-		j, err := w.Store.claim(ctx, id, w.Lease)
+		j, err := w.Store.claim(intake, id, w.Lease)
 		if err == pgx.ErrNoRows {
 			continue
 		}
 		if err != nil {
 			w.Logger.Error("claim", "job_id", id, "error", err)
-			idleWait(ctx, time.Second)
+			idleWait(intake, time.Second)
 			continue
 		}
-		w.process(ctx, j)
+		w.process(active, j)
 	}
 }
 
@@ -79,7 +107,7 @@ func (w *Worker) process(parent context.Context, j Job) {
 			}
 		}
 	}()
-	result, err := execute(ctx, j)
+	result, err := execute(ctx, j, w.Objects)
 	cancel()
 	<-done
 	if parent.Err() != nil {
@@ -107,7 +135,7 @@ func (w *Worker) process(parent context.Context, j Job) {
 	}
 }
 
-func execute(ctx context.Context, j Job) ([]byte, error) {
+func execute(ctx context.Context, j Job, objects *ObjectStore) ([]byte, error) {
 	switch j.Type {
 	case "sleep":
 		var p struct {
@@ -141,6 +169,11 @@ func execute(ctx context.Context, j Job) ([]byte, error) {
 	case "record_event":
 		// The event insert happens with completion in a single fenced DB transaction.
 		return []byte(`{"recorded":true}`), nil
+	case "resize_image":
+		if objects == nil {
+			return nil, errors.New("object storage is not configured")
+		}
+		return objects.resize(ctx, j)
 	default:
 		return nil, fmt.Errorf("unknown job type %q", j.Type)
 	}

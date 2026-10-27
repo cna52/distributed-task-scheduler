@@ -20,6 +20,14 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s --health-timeout 2s --health-retries 20
+      s3mock:
+        image: adobe/s3mock:5.2.3
+        env:
+          COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: scheduler-test-images
+        ports: ["9090:9090"]
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://localhost:9090/"
+          --health-interval 2s --health-timeout 2s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -30,4 +38,8 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://scheduler:scheduler@localhost:5432/scheduler_test?sslmode=disable
           TEST_REDIS_URL: redis://localhost:6379/1
+          TEST_OBJECT_ENDPOINT: localhost:9090
+          TEST_OBJECT_ACCESS_KEY: test
+          TEST_OBJECT_SECRET_KEY: test
+          TEST_OBJECT_BUCKET: scheduler-test-images
       - run: go build ./...

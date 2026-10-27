@@ -90,6 +90,14 @@ func (r *SubmitRequest) normalize() error {
 		if err := json.Unmarshal(r.Payload, &p); err != nil || strings.TrimSpace(p.Name) == "" || len(p.Name) > 200 {
 			return errors.New("record_event name must be 1..200 characters")
 		}
+	case "resize_image":
+		var p resizePayload
+		if err := json.Unmarshal(r.Payload, &p); err != nil {
+			return errors.New("invalid resize_image payload")
+		}
+		if err := p.validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown job type %q", r.Type)
 	}

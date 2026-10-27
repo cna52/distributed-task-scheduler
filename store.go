@@ -243,7 +243,7 @@ func (s *Store) publishOutbox(ctx context.Context, q *Queue, batch int) (int, er
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT o.id,j.id::text,j.priority,j.run_at FROM outbox o JOIN jobs j ON j.id=o.job_id
+	rows, err := tx.Query(ctx, `SELECT o.id,j.id::text,j.priority,j.run_at,j.status,j.run_at<=now() FROM outbox o JOIN jobs j ON j.id=o.job_id
 		WHERE o.delivered_at IS NULL AND o.available_at<=now() ORDER BY o.id LIMIT $1 FOR UPDATE OF o SKIP LOCKED`, batch)
 	if err != nil {
 		return 0, err
@@ -251,11 +251,13 @@ func (s *Store) publishOutbox(ctx context.Context, q *Queue, batch int) (int, er
 	type item struct {
 		outboxID int64
 		readyJob
+		status string
+		due    bool
 	}
 	var items []item
 	for rows.Next() {
 		var x item
-		if err := rows.Scan(&x.outboxID, &x.ID, &x.Priority, &x.RunAt); err != nil {
+		if err := rows.Scan(&x.outboxID, &x.ID, &x.Priority, &x.RunAt, &x.status, &x.due); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -266,20 +268,26 @@ func (s *Store) publishOutbox(ctx context.Context, q *Queue, batch int) (int, er
 	if err != nil {
 		return 0, err
 	}
+	var ready []readyJob
+	var jobIDs []string
+	var outboxIDs []int64
 	for _, x := range items {
-		var status string
-		if err = tx.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, x.ID).Scan(&status); err != nil {
+		outboxIDs = append(outboxIDs, x.outboxID)
+		if x.status == "queued" && x.due {
+			ready = append(ready, x.readyJob)
+			jobIDs = append(jobIDs, x.ID)
+		}
+	}
+	if err = q.publishBatch(ctx, ready); err != nil {
+		return 0, err
+	}
+	if len(jobIDs) > 0 {
+		if _, err = tx.Exec(ctx, `UPDATE jobs SET enqueued_at=now() WHERE id=ANY($1::uuid[]) AND status='queued'`, jobIDs); err != nil {
 			return 0, err
 		}
-		if status == "queued" {
-			if err = q.publish(ctx, x.readyJob); err != nil {
-				return 0, err
-			}
-			if _, err = tx.Exec(ctx, `UPDATE jobs SET enqueued_at=now() WHERE id=$1 AND status='queued'`, x.ID); err != nil {
-				return 0, err
-			}
-		}
-		if _, err = tx.Exec(ctx, `UPDATE outbox SET delivered_at=now() WHERE id=$1`, x.outboxID); err != nil {
+	}
+	if len(outboxIDs) > 0 {
+		if _, err = tx.Exec(ctx, `UPDATE outbox SET delivered_at=now() WHERE id=ANY($1::bigint[])`, outboxIDs); err != nil {
 			return 0, err
 		}
 	}
@@ -306,15 +314,37 @@ func (s *Store) reconcile(ctx context.Context, q *Queue, batch int) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	for _, x := range items {
-		if err = q.publish(ctx, x); err != nil {
-			return 0, err
+	if err = q.publishBatch(ctx, items); err != nil {
+		return 0, err
+	}
+	if len(items) > 0 {
+		ids := make([]string, 0, len(items))
+		for _, x := range items {
+			ids = append(ids, x.ID)
 		}
-		if _, err = s.DB.Exec(ctx, `UPDATE jobs SET enqueued_at=now() WHERE id=$1 AND status='queued'`, x.ID); err != nil {
+		if _, err = s.DB.Exec(ctx, `UPDATE jobs SET enqueued_at=now() WHERE id=ANY($1::uuid[]) AND status='queued'`, ids); err != nil {
 			return 0, err
 		}
 	}
 	return len(items), nil
+}
+
+type queueMetrics struct {
+	Pending              int64
+	OldestSeconds        float64
+	StartedSamples       int64
+	FirstStartP95Seconds float64
+}
+
+func (s *Store) queueMetrics(ctx context.Context) (queueMetrics, error) {
+	var m queueMetrics
+	err := s.DB.QueryRow(ctx, `SELECT count(*),COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0)::float8 FROM outbox WHERE delivered_at IS NULL`).Scan(&m.Pending, &m.OldestSeconds)
+	if err != nil {
+		return m, err
+	}
+	err = s.DB.QueryRow(ctx, `SELECT count(*),COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM started_at-created_at)::float8),0)
+		FROM jobs WHERE started_at>=now()-interval '5 minutes'`).Scan(&m.StartedSamples, &m.FirstStartP95Seconds)
+	return m, err
 }
 
 func (s *Store) check(ctx context.Context) error {

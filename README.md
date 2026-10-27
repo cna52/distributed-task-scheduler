@@ -34,13 +34,27 @@ Registered handlers:
 | `sleep` | `{"duration_ms":100}` | Waits 0–300000 ms and succeeds. |
 | `fail` | `{"failures":2}` | Fails its first two attempts, then succeeds. |
 | `record_event` | `{"name":"example"}` | Inserts one event keyed by job ID in the completion transaction. |
+| `resize_image` | `{"source_key":"inputs/photo.png","width":128,"height":128}` | Reads PNG/JPEG input from shared S3-compatible storage and writes a PNG thumbnail under `jobs/{job_id}/thumbnail.png`. |
+
+Try the image handler with the local S3Mock service and an existing PNG/JPEG file:
+
+```sh
+curl -sS -X PUT -H 'Content-Type: image/png' --data-binary @photo.png \
+  http://localhost:9090/scheduler-images/inputs/photo.png
+curl -sS -X POST http://localhost:8080/jobs -H 'Content-Type: application/json' \
+  -d '{"type":"resize_image","payload":{"source_key":"inputs/photo.png","width":128,"height":128}}'
+curl -sS http://localhost:8080/jobs/JOB_ID
+curl -sS http://localhost:9090/scheduler-images/jobs/JOB_ID/thumbnail.png -o thumbnail.png
+```
+
+Inputs are limited to 10 MiB, 8,000 pixels per side, and 20 million pixels total; requested dimensions are 1–1024 pixels. The handler preserves aspect ratio and does not enlarge small images. Input keys must stay under `inputs/`; outputs use a deterministic job-ID key, so replay overwrites the same object. Keep input objects immutable while their jobs may retry. The local S3Mock service stores objects on a named Docker volume. `OBJECT_ENDPOINT`, `OBJECT_ACCESS_KEY`, `OBJECT_SECRET_KEY`, and `OBJECT_BUCKET` configure workers for a different S3-compatible store.
 
 The API is intended for local development: it has no authentication or TLS. Compose binds its published ports to `127.0.0.1`.
 
 ## Reliability model
 
 1. Submission inserts a job and an outbox event in the same PostgreSQL transaction. The API can accept jobs while Redis is unavailable. The dispatcher publishes due events to Redis when it returns. An interrupted publish may be repeated; Redis sorted-set membership deduplicates a queued ID.
-2. Workers atomically remove IDs from Redis, then conditionally claim the corresponding PostgreSQL row. Only one worker receives the active lease. The worker renews it every third of its lease period (30 seconds by default).
+2. Workers atomically remove IDs from Redis, then conditionally claim the corresponding PostgreSQL row. Only one worker receives the active lease. The worker renews it every third of its lease period (30 seconds by default). On `SIGTERM` or `SIGINT`, a worker stops claiming jobs and allows active handlers to finish for 20 seconds by default; after that, unfinished jobs recover through lease expiry.
 3. A completion or failure update must present the active, unexpired lease token. The dispatcher requeues expired leases with exponential delay or marks the job failed when its attempt limit is reached. A periodic reconciliation scan restores eligible jobs lost after a Redis pop or Redis data loss; its normal recovery window is about 30 seconds.
 4. Ready jobs use three Redis sorted sets. FIFO is based on `run_at` within a priority. A shared seven-slot selection cycle gives four high, two normal, and one low slot while all three remain populated. Empty priorities yield their slot to available work.
 
@@ -51,15 +65,17 @@ Each handler may run more than once. `record_event` is duplicate-safe because it
 Requires Go 1.26 and Docker Compose. Start only the dependencies and create a separate test database:
 
 ```sh
-docker compose up -d postgres redis
+docker compose up -d postgres redis s3mock
 docker compose exec -T postgres createdb -U scheduler scheduler_test
 TEST_DATABASE_URL='postgres://scheduler:scheduler@localhost:5432/scheduler_test?sslmode=disable' \
-TEST_REDIS_URL='redis://localhost:6379/1' go test -race ./...
+TEST_REDIS_URL='redis://localhost:6379/1' \
+TEST_OBJECT_ENDPOINT='localhost:9090' TEST_OBJECT_ACCESS_KEY='test' \
+TEST_OBJECT_SECRET_KEY='test' TEST_OBJECT_BUCKET='scheduler-test-images' go test -race ./...
 ```
 
 The integration tests truncate the configured test database and flush the configured Redis database. Leave the `TEST_*` variables unset for unit-only tests. GitHub Actions runs the integration suite against service containers.
 
-The binaries accept `DATABASE_URL`, `REDIS_URL`, `HTTP_ADDR`, `WORKER_CONCURRENCY`, and `LEASE_SECONDS`. Use `go run . migrate`, `serve`, `dispatch`, or `worker` to run individual processes. `GET /metrics` exposes Prometheus-format submission, rejection, job-status, and Redis-ready metrics. JSON logs include job IDs and errors.
+The binaries accept `DATABASE_URL`, `REDIS_URL`, `HTTP_ADDR`, `WORKER_CONCURRENCY`, `LEASE_SECONDS`, and `SHUTDOWN_GRACE_SECONDS`. Compose gives workers a 25-second stop grace for the default 20-second drain. Use `go run . migrate`, `serve`, `dispatch`, or `worker` to run individual processes. `GET /metrics` exposes Prometheus-format submission, rejection, job-status, Redis-ready, and outbox metrics. `scheduler_outbox_oldest_pending_seconds` is the age of the oldest undelivered event (0 when empty). `scheduler_submission_to_first_start_seconds_p95` is a rolling five-minute p95 from creation to first claim, including intentional scheduling delay; `scheduler_submission_to_first_start_samples` reports its sample count. JSON logs include job IDs and errors.
 
 ## Failure drills and benchmark
 
@@ -92,3 +108,12 @@ Local measurements on 2026-10-24, Docker Desktop on arm64 with 10 assigned CPUs 
 | 200 jobs, 100 ms, 20 submitters | 3 | 99.8 jobs/s | 1.91 s |
 
 The zero-duration workload is limited by dispatch, database, and API overhead, so extra workers did not improve its throughput in this run. The 100 ms workload shows the expected increase in execution capacity. These are single-run local measurements, not production capacity guarantees.
+
+After batching outbox publication, a fixed before/after comparison on 2026-10-26 used the same host API/dispatcher/worker setup, one worker with four goroutines, Docker PostgreSQL and Redis, 1,000 zero-duration jobs, and 20 submitters:
+
+| Dispatcher | Throughput | p95 completion latency |
+| --- | ---: | ---: |
+| Prior commit `3aa7e2c`, per-job Redis and SQL writes | 681 jobs/s | 1.12 s |
+| Batched Redis pipeline and SQL updates | 954 jobs/s | 696 ms |
+
+These are single-run measurements on a development machine. The host-process setup differs from the earlier all-Compose measurements, so compare only rows within the same table.

@@ -42,6 +42,16 @@ func (a *API) routes() http.Handler {
 		io.WriteString(w, "scheduler_submissions_total "+strconv.FormatUint(a.submitted.Load(), 10)+"\n")
 		io.WriteString(w, "# TYPE scheduler_rejections_total counter\n")
 		io.WriteString(w, "scheduler_rejections_total "+strconv.FormatUint(a.rejected.Load(), 10)+"\n")
+		if m, err := a.Store.queueMetrics(r.Context()); err == nil {
+			io.WriteString(w, "# TYPE scheduler_outbox_pending gauge\n")
+			io.WriteString(w, "scheduler_outbox_pending "+strconv.FormatInt(m.Pending, 10)+"\n")
+			io.WriteString(w, "# TYPE scheduler_outbox_oldest_pending_seconds gauge\n")
+			io.WriteString(w, "scheduler_outbox_oldest_pending_seconds "+strconv.FormatFloat(m.OldestSeconds, 'f', 3, 64)+"\n")
+			io.WriteString(w, "# TYPE scheduler_submission_to_first_start_seconds_p95 gauge\n")
+			io.WriteString(w, "scheduler_submission_to_first_start_seconds_p95 "+strconv.FormatFloat(m.FirstStartP95Seconds, 'f', 3, 64)+"\n")
+			io.WriteString(w, "# TYPE scheduler_submission_to_first_start_samples gauge\n")
+			io.WriteString(w, "scheduler_submission_to_first_start_samples "+strconv.FormatInt(m.StartedSamples, 10)+"\n")
+		}
 		rows, err := a.Store.DB.Query(r.Context(), `SELECT status,count(*) FROM jobs GROUP BY status`)
 		if err == nil {
 			defer rows.Close()

@@ -20,10 +20,22 @@ func openQueue(ctx context.Context, url string) (*Queue, error) {
 }
 
 func (q *Queue) publish(ctx context.Context, j readyJob) error {
-	if j.Priority != "high" && j.Priority != "normal" && j.Priority != "low" {
-		return errors.New("invalid priority")
+	return q.publishBatch(ctx, []readyJob{j})
+}
+
+func (q *Queue) publishBatch(ctx context.Context, jobs []readyJob) error {
+	pipe := q.Client.Pipeline()
+	for _, j := range jobs {
+		if j.Priority != "high" && j.Priority != "normal" && j.Priority != "low" {
+			return errors.New("invalid priority")
+		}
+		pipe.ZAddNX(ctx, "ready:"+j.Priority, redis.Z{Score: float64(j.RunAt.UnixMicro()), Member: j.ID})
 	}
-	return q.Client.ZAddNX(ctx, "ready:"+j.Priority, redis.Z{Score: float64(j.RunAt.UnixMicro()), Member: j.ID}).Err()
+	if len(jobs) == 0 {
+		return nil
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // One Redis script owns selection and removal. The shared cycle guarantees a

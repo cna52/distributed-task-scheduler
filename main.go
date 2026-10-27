@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -45,7 +46,7 @@ func main() {
 		}
 		return
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	s, err := openStore(ctx, env("DATABASE_URL", "postgres://scheduler:scheduler@localhost:5432/scheduler?sslmode=disable"))
 	if err != nil {
@@ -88,8 +89,16 @@ func main() {
 		}
 	case "worker":
 		lease := time.Duration(envInt("LEASE_SECONDS", 30)) * time.Second
-		w := &Worker{Store: s, Queue: q, Concurrency: envInt("WORKER_CONCURRENCY", 4), Lease: lease, Logger: logger}
-		logger.Info("worker started", "concurrency", w.Concurrency, "lease", lease.String())
+		w := &Worker{Store: s, Queue: q, Concurrency: envInt("WORKER_CONCURRENCY", 4), Lease: lease, ShutdownGrace: time.Duration(envInt("SHUTDOWN_GRACE_SECONDS", 20)) * time.Second, Logger: logger}
+		if endpoint := os.Getenv("OBJECT_ENDPOINT"); endpoint != "" {
+			objects, err := openObjectStore(ctx, endpoint, os.Getenv("OBJECT_ACCESS_KEY"), os.Getenv("OBJECT_SECRET_KEY"), os.Getenv("OBJECT_BUCKET"))
+			if err != nil {
+				logger.Error("object store connect", "error", err)
+				os.Exit(1)
+			}
+			w.Objects = objects
+		}
+		logger.Info("worker started", "concurrency", w.Concurrency, "lease", lease.String(), "shutdown_grace", w.ShutdownGrace.String())
 		w.run(ctx)
 	case "dispatch":
 		logger.Info("dispatcher started")
